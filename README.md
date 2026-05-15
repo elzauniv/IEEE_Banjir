@@ -19,8 +19,7 @@ Dashboard Performa: Menampilkan metrik akurasi, G-Mean Score, dan Classification
 2. style.css: File desain untuk kustomisasi tampilan antarmuka agar lebih profesional.
 3. index.html: Struktur elemen HTML statis (opsional/pendukung).
 4. XGBoost.ipynb: File riset asli yang berisi proses training dan validasi model.
-
-Banjir all - Data Acak (1).csv: Dataset utama yang digunakan untuk melatih model.
+5. Banjir all - Data Acak (1).csv: Dataset utama yang digunakan untuk melatih model.
 
 ⚙️ Cara Menjalankan
 Pastikan Anda telah menginstal pustaka yang diperlukan:
@@ -36,9 +35,9 @@ streamlit run app.py
 📊 Logika Klasifikasi
 Model membagi tingkat bahaya banjir berdasarkan ambang batas Tinggi Muka Air (TMA) sebagai berikut:
 
-Normal: TMA < 0.57 meter.
-Waspada: 0.57 ≤ TMA < 0.93 meter.
-Siaga: 0.93 ≤ TMA ≤ 1.30 meter.
-Awas: TMA > 1.30 meter.
+> Normal: TMA < 0.57 meter.
+> Waspada: 0.57 ≤ TMA < 0.93 meter.
+> Siaga: 0.93 ≤ TMA ≤ 1.30 meter.
+> Awas: TMA > 1.30 meter.
 
 Dibuat untuk mendukung mitigasi bencana banjir di wilayah Kabupaten Bandung menggunakan pendekatan data sains.
