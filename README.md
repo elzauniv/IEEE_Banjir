@@ -2,6 +2,7 @@
 Aplikasi berbasis web ini dirancang untuk memprediksi level siaga banjir di wilayah Kabupaten Bandung (khususnya Dayeuhkolot dan sekitarnya) menggunakan algoritma XGBoost Classifier. Sistem ini mengintegrasikan pemrosesan data sains dengan antarmuka pengguna yang interaktif.
 
 Website versi 1.0 : https://banjir-ieee.streamlit.app/
+
 Website versi 2.0 : 
 
 🚀 Fitur Utama
