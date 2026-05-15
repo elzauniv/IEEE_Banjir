@@ -1,4 +1,5 @@
 🌊 Sistem Peringatan Dini Banjir Kabupaten Bandung
+
 Aplikasi berbasis web ini dirancang untuk memprediksi level siaga banjir di wilayah Kabupaten Bandung (khususnya Dayeuhkolot dan sekitarnya) menggunakan algoritma XGBoost Classifier. Sistem ini mengintegrasikan pemrosesan data sains dengan antarmuka pengguna yang interaktif.
 
 Website versi 1.0 : https://banjir-ieee.streamlit.app/
@@ -40,8 +41,13 @@ streamlit run app.py
 Model membagi tingkat bahaya banjir berdasarkan ambang batas Tinggi Muka Air (TMA) sebagai berikut:
 
 > Normal: TMA < 0.57 meter.
+
 > Waspada: 0.57 ≤ TMA < 0.93 meter.
+
+
 > Siaga: 0.93 ≤ TMA ≤ 1.30 meter.
+
+
 > Awas: TMA > 1.30 meter.
 
 Dibuat untuk mendukung mitigasi bencana banjir di wilayah Kabupaten Bandung menggunakan pendekatan data sains.
