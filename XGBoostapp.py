@@ -141,6 +141,47 @@ koordinat_stasiun = {
     "Bojongsoang": [-6.9740, 107.6400]
 }
 
+
+# --- FUNGSI PEMBERSIH OUTLIER (BARU) ---
+def bersihkan_outlier(df, kolom_list, faktor_iqr=1.5):
+    """
+    Membuang / meng-clip nilai ekstrem (outlier) pada kolom numerik menggunakan metode IQR.
+    Ini penting karena sensor lapangan (Curah Hujan, Debit Air, Muka Air) kadang mencatat
+    nilai yang salah input / error alat (misalnya TMA tercatat puluhan meter), dan nilai
+    seperti itu bisa membuat rata-rata (mean) klimatologi jadi jauh meleset dari kondisi
+    nyata -- inilah sebab prakiraan 7 hari sebelumnya selalu menunjukkan TMA ~4 m / status
+    Awas terus-menerus walau di lapangan kondisinya jauh lebih rendah.
+
+    Nilai di luar [Q1 - faktor*IQR, Q3 + faktor*IQR] di-clip ke batas tersebut (bukan dibuang
+    barisnya), supaya jumlah data historis tidak berkurang tapi pengaruh outlier ekstremnya
+    dijinakkan.
+    """
+    df = df.copy()
+    info_outlier = {}
+    for col in kolom_list:
+        if col not in df.columns:
+            continue
+        data_valid = df[col].dropna()
+        if data_valid.empty:
+            continue
+        q1 = data_valid.quantile(0.25)
+        q3 = data_valid.quantile(0.75)
+        iqr = q3 - q1
+        if iqr == 0 or pd.isna(iqr):
+            continue
+        batas_bawah = q1 - faktor_iqr * iqr
+        batas_atas = q3 + faktor_iqr * iqr
+        # Muka Air / Debit Air / Curah Hujan secara fisik tidak boleh negatif
+        batas_bawah = max(batas_bawah, 0)
+
+        n_outlier = int(((df[col] < batas_bawah) | (df[col] > batas_atas)).sum())
+        info_outlier[col] = {"n_outlier": n_outlier, "batas_bawah": batas_bawah, "batas_atas": batas_atas}
+
+        df[col] = df[col].clip(lower=batas_bawah, upper=batas_atas)
+
+    return df, info_outlier
+
+
 # --- SIDEBAR ---
 with st.sidebar:
     try:
@@ -179,8 +220,12 @@ def prepare_model(lokasi_terpilih):
         df_train[col] = pd.to_numeric(df_train[col], errors='coerce')
     
     df_train = df_train.ffill().bfill()
-    
-    # Target Engineering (Level Banjir)
+
+    # (BARU) Bersihkan outlier / nilai error sensor SEBELUM dipakai untuk melatih model,
+    # supaya model tidak ikut belajar dari nilai yang tidak masuk akal.
+    df_train, info_outlier_train = bersihkan_outlier(df_train, kolom_numerik)
+
+    # Target Engineering (Level Banjir) -- dihitung SETELAH outlier dibersihkan
     df_train['Level_Banjir'] = df_train['Muka Air'].apply(tentukan_level_banjir)
 
     # Encoding Fitur (Kecamatan)
@@ -213,7 +258,8 @@ def prepare_model(lokasi_terpilih):
         "accuracy": accuracy_score(y_test, y_pred),
         "report": classification_report(y_test, y_pred, target_names=le_target.classes_, output_dict=True),
         "gmean": geometric_mean_score(y_test, y_pred, average='macro'),
-        "cm": confusion_matrix(y_test, y_pred)
+        "cm": confusion_matrix(y_test, y_pred),
+        "outlier_info": info_outlier_train,
     }
 
     return model_xgb, le_kec, le_target, metrics
@@ -245,6 +291,13 @@ def load_dataset_mentah():
     for col in ['Curah Hujan', 'Debit Air', 'Muka Air']:
         if col in df_mentah.columns:
             df_mentah[col] = pd.to_numeric(df_mentah[col], errors='coerce')
+
+    # (BARU) Bersihkan outlier di data mentah juga, karena inilah sumber angka klimatologi
+    # (rata-rata historis) yang dipakai tab "Prakiraan 7 Hari". Tanpa ini, satu-dua baris
+    # dengan nilai sensor yang error bisa membuat rata-rata melenceng jauh (contoh nyata:
+    # TMA prakiraan nyangkut di ~4 m terus padahal kondisi normalnya jauh di bawah itu).
+    df_mentah, _ = bersihkan_outlier(df_mentah, ['Curah Hujan', 'Debit Air', 'Muka Air'])
+
     df_mentah['Tanggal'] = pd.to_datetime(df_mentah['Tanggal'], errors='coerce')
     df_mentah['DayOfYear'] = df_mentah['Tanggal'].dt.dayofyear
     df_mentah['Kecamatan'] = df_mentah['Kecamatan'].astype(str).str.strip()
@@ -253,10 +306,17 @@ def load_dataset_mentah():
 
 def get_climatology(df_hist, stasiun, target_doy, window=7):
     """
-    Mengambil rata-rata & standar deviasi historis Curah Hujan, Debit Air, dan TMA
+    Mengambil MEDIAN & IQR (bukan mean/std biasa) historis Curah Hujan, Debit Air, dan TMA
     di sekitar tanggal target (+- `window` hari, lintas tahun 2020-2024) untuk stasiun
     tertentu — ini yang membuat prakiraan H+1..H+6 'berbasis dataset' alih-alih angka acak
-    sembarangan. Fallback bertingkat dipakai bila data spesifik tidak cukup:
+    sembarangan.
+
+    (PERBAIKAN) Sebelumnya fungsi ini memakai MEAN, yang sangat sensitif terhadap outlier:
+    walau outlier sudah di-clip di tahap load, memakai median di sini menambah lapisan
+    ketahanan ekstra supaya klimatologi tetap representatif terhadap kondisi tipikal,
+    bukan tertarik oleh beberapa hari ekstrem di histori.
+
+    Fallback bertingkat dipakai bila data spesifik tidak cukup:
     1) stasiun terkait pada musim yang sama, 2) seluruh histori stasiun terkait,
     3) seluruh histori Dayeuhkolot (data terlengkap), 4) rata-rata seluruh dataset.
     """
@@ -268,11 +328,11 @@ def get_climatology(df_hist, stasiun, target_doy, window=7):
         if sub[kolom].dropna(how='all').empty:
             return None
         return {
-            'hujan_mean': sub['Curah Hujan'].mean(skipna=True),
+            'hujan_mean': sub['Curah Hujan'].median(skipna=True),
             'hujan_std': sub['Curah Hujan'].std(skipna=True),
-            'debit_mean': sub['Debit Air'].mean(skipna=True),
+            'debit_mean': sub['Debit Air'].median(skipna=True),
             'debit_std': sub['Debit Air'].std(skipna=True),
-            'muka_mean': sub['Muka Air'].mean(skipna=True),
+            'muka_mean': sub['Muka Air'].median(skipna=True),
             'muka_std': sub['Muka Air'].std(skipna=True),
             'n': len(sub),
         }
@@ -320,11 +380,11 @@ def generate_weekly_forecast(model, le_kec, le_target, df_hist, aliran_induk, st
     tanpa perlu input manual apa pun.
 
     Untuk tiap tanggal target (Hari Ini, Hari Ini+1, ..., Hari Ini+6), nilai Curah Hujan,
-    Debit Air, dan TMA diambil dari rata-rata historis pada TANGGAL YANG SAMA (bulan & hari)
-    di seluruh tahun yang tersedia pada dataset (2020-2024) untuk stasiun terkait.
-    Contoh: untuk meramal 8 Januari, dipakai rata-rata data tanggal 8 Januari dari tahun
-    2020, 2021, 2022, 2023, dan 2024 (memakai jendela +-7 hari di sekitarnya bila datanya
-    terlalu sedikit pada tanggal persis tersebut).
+    Debit Air, dan TMA diambil dari MEDIAN historis pada TANGGAL YANG SAMA (bulan & hari)
+    di seluruh tahun yang tersedia pada dataset (2020-2024) untuk stasiun terkait, setelah
+    data dibersihkan dari outlier. Contoh: untuk meramal 8 Januari, dipakai median data
+    tanggal 8 Januari dari tahun 2020, 2021, 2022, 2023, dan 2024 (memakai jendela +-7 hari
+    di sekitarnya bila datanya terlalu sedikit pada tanggal persis tersebut).
 
     Bila dataset historis tidak ditemukan (df_hist None), mengembalikan (None, None, False)
     supaya pemanggil bisa menampilkan pesan bahwa dataset diperlukan untuk tab ini.
@@ -350,7 +410,10 @@ def generate_weekly_forecast(model, le_kec, le_target, df_hist, aliran_induk, st
 
         hujan = float(np.clip(clim['hujan_mean'], 0, 250))
         debit = float(np.clip(clim['debit_mean'], 0, 700))
-        muka = float(np.clip(clim['muka_mean'], 0, 10))
+        # (PERBAIKAN) Batas atas TMA realistis diperketat dari 10 m menjadi 5 m.
+        # TMA 5-10 meter tidak masuk akal untuk sungai di wilayah ini dan sebelumnya bisa
+        # lolos begitu saja ke model jika klimatologi kebetulan menghasilkan angka besar.
+        muka = float(np.clip(clim['muka_mean'], 0, 5))
 
         input_df = pd.DataFrame(
             [[kec_encoded, hujan, debit, muka]],
@@ -536,16 +599,27 @@ with tab3:
     - Data dilatih menggunakan dataset: `Banjir all - Data Acak (1).csv`.
     """)
 
+    # (BARU) Tampilkan info outlier yang dibersihkan, biar transparan ke pengguna
+    outlier_info = model_metrics.get("outlier_info", {})
+    if outlier_info:
+        with st.expander("🔍 Info Pembersihan Outlier pada Data Latih"):
+            for col, info in outlier_info.items():
+                st.write(
+                    f"- **{col}**: {info['n_outlier']} baris di-clip ke rentang "
+                    f"[{info['batas_bawah']:.2f}, {info['batas_atas']:.2f}] "
+                    f"(nilai di luar rentang ini dianggap outlier/error sensor)."
+                )
+
 with tab4:
     st.subheader("📅 Prakiraan Potensi Banjir 7 Hari ke Depan")
     aliran_induk_fc = pemetaan_aliran.get(lokasi_select, "Dayeuhkolot")
     st.write(
         f"Prakiraan untuk stasiun acuan **{aliran_induk_fc}** dihitung otomatis dari **tanggal** "
         f"pada dataset historis — tanpa perlu mengisi apa pun. Untuk tiap hari ke depan, nilai "
-        f"Curah Hujan, Debit Air, dan TMA diambil dari rata-rata kondisi pada **tanggal yang sama** "
-        f"di tahun-tahun sebelumnya (2020-2024), lalu dinilai ulang oleh model XGBoost. "
-        f"Contoh: untuk meramal 8 Januari, dipakai rata-rata data tanggal 8 Januari dari tahun "
-        f"2020 sampai 2024."
+        f"Curah Hujan, Debit Air, dan TMA diambil dari **median** kondisi pada **tanggal yang sama** "
+        f"di tahun-tahun sebelumnya (2020-2024, setelah outlier dibersihkan), lalu dinilai ulang oleh "
+        f"model XGBoost. Contoh: untuk meramal 8 Januari, dipakai median data tanggal 8 Januari dari "
+        f"tahun 2020 sampai 2024."
     )
 
     perlu_generate = (
@@ -668,8 +742,8 @@ with tab4:
 
     if waktu_buat:
         st.caption(
-            f"Dihitung pada {waktu_buat.strftime('%H:%M:%S WIB')} dari rata-rata historis "
-            f"tanggal yang sama di dataset (stasiun acuan: {stasiun_acuan_fc}). "
+            f"Dihitung pada {waktu_buat.strftime('%H:%M:%S WIB')} dari median historis "
+            f"tanggal yang sama di dataset (stasiun acuan: {stasiun_acuan_fc}, outlier sudah dibersihkan). "
             "Prakiraan akan menyesuaikan otomatis tiap hari, dan ikut berubah bila lokasi diganti."
         )
 
