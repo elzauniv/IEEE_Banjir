@@ -53,7 +53,11 @@ def _normalisasi_nama(s):
 def cocokkan_kecamatan(daftar_kelas, nama_target):
     """Mencocokkan nama 'aliran induk' (dari pemetaan_aliran) ke salah satu nama Kecamatan
     yang benar-benar ada di dataset CSV. Dilakukan bertahap: cocok persis (setelah normalisasi),
-    lalu cocok sebagian (substring), lalu fallback ke 'Dayeuhkolot' (data paling lengkap).
+    lalu cocok sebagian (substring), lalu cari ANGGOTA KELOMPOK ALIRAN yang sama (mis. target
+    'Cikeruh - Jatiroke' tidak pernah muncul persis sebagai nama Kecamatan di CSV, tapi anggotanya
+    seperti 'Cicalengka'/'Rancaekek' ada -- jadi salah satu dari anggota itu yang dipakai, BUKAN
+    asal fallback ke 'Dayeuhkolot' yang bisa menyesatkan). Fallback ke 'Dayeuhkolot' hanya dipakai
+    kalau benar-benar tidak ada satu pun anggota kelompok yang cocok.
     Mengembalikan nama_kecamatan_terpilih."""
     daftar_kelas = list(daftar_kelas)
     target_norm = _normalisasi_nama(nama_target)
@@ -65,6 +69,15 @@ def cocokkan_kecamatan(daftar_kelas, nama_target):
         c_norm = _normalisasi_nama(c)
         if target_norm in c_norm or c_norm in target_norm:
             return c
+
+    # (BARU) Cari anggota kelompok aliran yang sama (mis. target = "Cikeruh - Jatiroke",
+    # dicari raw Kecamatan yang kelompoknya juga "Cikeruh - Jatiroke").
+    kelompok_target = kelompok_mentah.get(nama_target)
+    if kelompok_target:
+        for c in daftar_kelas:
+            if kelompok_mentah.get(c) == kelompok_target:
+                return c
+
     if "Dayeuhkolot" in daftar_kelas:
         return "Dayeuhkolot"
     return daftar_kelas[0] if daftar_kelas else None
@@ -140,6 +153,94 @@ koordinat_stasiun = {
     "Cisondari - Pasirjambu": [-7.0680, 107.4780],
     "Bojongsoang": [-6.9740, 107.6400]
 }
+
+# --- (BARU) Peta nama Kecamatan MENTAH (persis seperti tertulis di kolom 'Kecamatan' pada
+# CSV) -> kelompok aliran. Berbeda dari `pemetaan_aliran` di atas (yang keyed oleh nama
+# tampilan panjang di sidebar), dict ini dipakai untuk mengelompokkan BARIS DATA TRAINING
+# supaya threshold level banjir & pembersihan outlier bisa dihitung RELATIF per kelompok
+# stasiun -- soalnya skala TMA (Tinggi Muka Air) berbeda jauh antar lokasi (mis. median
+# Dayeuhkolot ~4 m, sementara hulu seperti Cisanti ~0.1 m). Satu angka ambang batas mutlak
+# (mis. 1.30 m = Awas) tidak masuk akal dipakai untuk semua lokasi sekaligus.
+kelompok_mentah = {
+    "Dayeuhkolot": "Dayeuhkolot", "Cisanti": "Dayeuhkolot", "Kertasari": "Dayeuhkolot",
+    "Majalaya": "Dayeuhkolot", "Hantap": "Dayeuhkolot", "Margahayu": "Dayeuhkolot",
+    "Margaasih": "Dayeuhkolot", "Banjaran": "Dayeuhkolot", "Rancamaya": "Dayeuhkolot",
+    "Baleendah": "Dayeuhkolot", "Ciparay": "Dayeuhkolot",
+    "Cipanas - Margamukti": "Cipanas - Margamukti", "Cipanas": "Cipanas - Margamukti",
+    "Cileunca": "Cipanas - Margamukti", "Kertamanah": "Cipanas - Margamukti",
+    "Arjasari": "Cipanas - Margamukti", "Pangalengan": "Cipanas - Margamukti",
+    "Pameungpeuk": "Cipanas - Margamukti", "Pamengpeuk": "Cipanas - Margamukti",
+    "Rancabli": "Cipanas - Margamukti",
+    "Cikeruh - Jatiroke": "Cikeruh - Jatiroke", "Jatiroke": "Cikeruh - Jatiroke",
+    "Cicalengka": "Cikeruh - Jatiroke", "Ciluluk": "Cikeruh - Jatiroke",
+    "Rancaekek": "Cikeruh - Jatiroke", "Solokanjeruk": "Cikeruh - Jatiroke",
+    "Solkanjeruk": "Cikeruh - Jatiroke", "Cileunyi": "Cikeruh - Jatiroke", "Nagreg": "Cikeruh - Jatiroke",
+    "Cisondari - Pasirjambu": "Cisondari - Pasirjambu", "Cisondari": "Cisondari - Pasirjambu",
+    "Cisondari-Pasir Jambu": "Cisondari - Pasirjambu", "Ciwidey": "Cisondari - Pasirjambu",
+    "Pasirjambu": "Cisondari - Pasirjambu", "Soreang": "Cisondari - Pasirjambu",
+    "Bojongsoang": "Bojongsoang", "Cipaku": "Bojongsoang",
+}
+
+
+def get_kelompok(nama_kecamatan_mentah):
+    """Ambil kelompok aliran dari nama Kecamatan mentah; fallback ke Dayeuhkolot
+    (kelompok dengan data terbanyak) kalau nama tidak dikenali."""
+    return kelompok_mentah.get(str(nama_kecamatan_mentah).strip(), "Dayeuhkolot")
+
+
+def bersihkan_outlier_per_kelompok(df, kolom_list, faktor_iqr=1.5):
+    """Sama seperti `bersihkan_outlier`, tapi dihitung TERPISAH untuk tiap kelompok aliran
+    (bukan satu IQR global buat semua stasiun dicampur). Ini penting karena kalau dihitung
+    global, nilai wajar di satu stasiun (mis. Dayeuhkolot ~4 m) bisa membuat batas IQR jadi
+    longgar untuk stasiun lain yang skalanya jauh lebih kecil, atau sebaliknya."""
+    if 'Kecamatan' not in df.columns:
+        return bersihkan_outlier(df, kolom_list, faktor_iqr)
+
+    df = df.copy()
+    df['_Kelompok_tmp'] = df['Kecamatan'].apply(get_kelompok)
+    hasil = []
+    info_gabungan = {}
+    for nama_kel, sub in df.groupby('_Kelompok_tmp'):
+        sub_bersih, info = bersihkan_outlier(sub, kolom_list, faktor_iqr)
+        hasil.append(sub_bersih)
+        info_gabungan[nama_kel] = info
+    df_bersih = pd.concat(hasil).sort_index()
+    df_bersih = df_bersih.drop(columns=['_Kelompok_tmp'])
+    return df_bersih, info_gabungan
+
+
+def hitung_threshold_relatif(df, kolom_muka='Muka Air'):
+    """Hitung ambang batas level banjir RELATIF per kelompok aliran, memakai persentil
+    50/80/95 dari data (yang sudah dibersihkan outlier-nya). Menggantikan ambang batas
+    mutlak (0.57/0.93/1.30 m) yang sebelumnya dipakai sama untuk semua stasiun."""
+    df = df.copy()
+    df['_Kelompok_tmp'] = df['Kecamatan'].apply(get_kelompok)
+    thresholds = {}
+    for nama_kel, sub in df.groupby('_Kelompok_tmp'):
+        data_valid = sub[kolom_muka].dropna()
+        if data_valid.empty:
+            continue
+        q50, q80, q95 = data_valid.quantile([0.5, 0.8, 0.95])
+        thresholds[nama_kel] = {"q50": float(q50), "q80": float(q80), "q95": float(q95)}
+    return thresholds
+
+
+def tentukan_level_relatif(tma, nama_kecamatan_mentah, thresholds):
+    """Versi relatif dari `tentukan_level_banjir`: ambang batas diambil per kelompok aliran
+    (bukan satu angka absolut buat semua stasiun)."""
+    kel = get_kelompok(nama_kecamatan_mentah)
+    q = thresholds.get(kel)
+    if q is None:
+        # fallback: pakai threshold absolut lama kalau kelompok tidak dikenali sama sekali
+        return tentukan_level_banjir(tma)
+    if tma < q['q50']:
+        return '0 - Normal'
+    elif tma < q['q80']:
+        return '1 - Waspada (Siaga 3)'
+    elif tma < q['q95']:
+        return '2 - Siaga (Siaga 2)'
+    else:
+        return '3 - Awas (Siaga 1)'
 
 
 # --- FUNGSI PEMBERSIH OUTLIER (BARU) ---
@@ -221,12 +322,20 @@ def prepare_model(lokasi_terpilih):
     
     df_train = df_train.ffill().bfill()
 
-    # (BARU) Bersihkan outlier / nilai error sensor SEBELUM dipakai untuk melatih model,
-    # supaya model tidak ikut belajar dari nilai yang tidak masuk akal.
-    df_train, info_outlier_train = bersihkan_outlier(df_train, kolom_numerik)
+    # (BARU) Bersihkan outlier PER KELOMPOK ALIRAN (bukan global), supaya skala TMA yang
+    # memang berbeda antar stasiun (mis. Dayeuhkolot yang lebih dalam) tidak ikut kepotong
+    # gara-gara disamakan dengan stasiun lain yang skalanya jauh lebih kecil.
+    df_train, info_outlier_train = bersihkan_outlier_per_kelompok(df_train, kolom_numerik)
 
-    # Target Engineering (Level Banjir) -- dihitung SETELAH outlier dibersihkan
-    df_train['Level_Banjir'] = df_train['Muka Air'].apply(tentukan_level_banjir)
+    # (BARU) Threshold level banjir dihitung RELATIF per kelompok aliran (persentil
+    # 50/80/95), BUKAN satu angka absolut (0.57/0.93/1.30 m) untuk semua stasiun. Ini
+    # bikin klasifikasi "Awas" berarti "TMA tergolong tinggi UNTUK STASIUN itu", bukan
+    # dibandingkan ke stasiun lain yang skalanya beda jauh.
+    thresholds_relatif = hitung_threshold_relatif(df_train, 'Muka Air')
+    df_train['Level_Banjir'] = df_train.apply(
+        lambda row: tentukan_level_relatif(row['Muka Air'], row['Kecamatan'], thresholds_relatif),
+        axis=1
+    )
 
     # Encoding Fitur (Kecamatan)
     le_kec = LabelEncoder()
@@ -260,6 +369,7 @@ def prepare_model(lokasi_terpilih):
         "gmean": geometric_mean_score(y_test, y_pred, average='macro'),
         "cm": confusion_matrix(y_test, y_pred),
         "outlier_info": info_outlier_train,
+        "thresholds_relatif": thresholds_relatif,
     }
 
     return model_xgb, le_kec, le_target, metrics
@@ -296,7 +406,7 @@ def load_dataset_mentah():
     # (rata-rata historis) yang dipakai tab "Prakiraan 7 Hari". Tanpa ini, satu-dua baris
     # dengan nilai sensor yang error bisa membuat rata-rata melenceng jauh (contoh nyata:
     # TMA prakiraan nyangkut di ~4 m terus padahal kondisi normalnya jauh di bawah itu).
-    df_mentah, _ = bersihkan_outlier(df_mentah, ['Curah Hujan', 'Debit Air', 'Muka Air'])
+    df_mentah, _ = bersihkan_outlier_per_kelompok(df_mentah, ['Curah Hujan', 'Debit Air', 'Muka Air'])
 
     df_mentah['Tanggal'] = pd.to_datetime(df_mentah['Tanggal'], errors='coerce')
     df_mentah['DayOfYear'] = df_mentah['Tanggal'].dt.dayofyear
@@ -601,20 +711,24 @@ with tab3:
     st.info("""
     **Catatan Teknis:**
     - Model menggunakan **XGBoost Classifier** dengan parameter `mlogloss`.
-    - Klasifikasi dibagi menjadi 4 kelas sesuai standar TMA di notebook.
+    - Klasifikasi dibagi menjadi 4 level, dengan ambang batas dihitung **relatif per
+      kelompok stasiun** (persentil 50/80/95 dari histori TMA masing-masing), bukan satu
+      angka mutlak yang sama untuk semua lokasi.
     - Data dilatih menggunakan dataset: `Banjir all - Data Acak (1).csv`.
     """)
 
     # (BARU) Tampilkan info outlier yang dibersihkan, biar transparan ke pengguna
+    # (sekarang dikelompokkan per stasiun karena pembersihan dilakukan per kelompok aliran)
     outlier_info = model_metrics.get("outlier_info", {})
     if outlier_info:
         with st.expander("🔍 Info Pembersihan Outlier pada Data Latih"):
-            for col, info in outlier_info.items():
-                st.write(
-                    f"- **{col}**: {info['n_outlier']} baris di-clip ke rentang "
-                    f"[{info['batas_bawah']:.2f}, {info['batas_atas']:.2f}] "
-                    f"(nilai di luar rentang ini dianggap outlier/error sensor)."
-                )
+            for nama_kel, info_per_kolom in outlier_info.items():
+                st.write(f"**Kelompok {nama_kel}:**")
+                for col, info in info_per_kolom.items():
+                    st.write(
+                        f"- {col}: {info['n_outlier']} baris di-clip ke rentang "
+                        f"[{info['batas_bawah']:.2f}, {info['batas_atas']:.2f}]"
+                    )
 
 with tab4:
     st.subheader("📅 Prakiraan Potensi Banjir 7 Hari ke Depan")
@@ -754,13 +868,28 @@ with tab4:
         )
 
     st.divider()
-    st.write("**Keterangan Level:**")
+    st.write("**Keterangan Level (relatif untuk stasiun ini):**")
+    kel_fc = get_kelompok(stasiun_acuan_fc)
+    q_fc = model_metrics.get("thresholds_relatif", {}).get(kel_fc)
+    if q_fc:
+        rng_normal = f"< {q_fc['q50']:.2f} m"
+        rng_waspada = f"{q_fc['q50']:.2f} - {q_fc['q80']:.2f} m"
+        rng_siaga = f"{q_fc['q80']:.2f} - {q_fc['q95']:.2f} m"
+        rng_awas = f"> {q_fc['q95']:.2f} m"
+    else:
+        rng_normal, rng_waspada, rng_siaga, rng_awas = "n/a", "n/a", "n/a", "n/a"
+
+    st.caption(
+        f"Ambang batas dihitung relatif dari histori kelompok stasiun **{kel_fc}** "
+        "(persentil 50/80/95), bukan angka mutlak yang sama untuk semua lokasi -- "
+        "soalnya kedalaman sungai wajar berbeda-beda antar titik pantau."
+    )
     leg_cols = st.columns(4)
     legend_items = [
-        ("☀️", "#4dd07a", "0 - Normal", "TMA < 0.57 m"),
-        ("⛅", "#f5d547", "1 - Waspada", "0.57 - 0.93 m"),
-        ("🌧️", "#ff9f43", "2 - Siaga", "0.93 - 1.30 m"),
-        ("⛈️", "#ff5c5c", "3 - Awas", "> 1.30 m"),
+        ("☀️", "#4dd07a", "0 - Normal", rng_normal),
+        ("⛅", "#f5d547", "1 - Waspada", rng_waspada),
+        ("🌧️", "#ff9f43", "2 - Siaga", rng_siaga),
+        ("⛈️", "#ff5c5c", "3 - Awas", rng_awas),
     ]
     for col, (icon, color, label, rng_txt) in zip(leg_cols, legend_items):
         with col:
