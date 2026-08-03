@@ -1,0 +1,767 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import random
+from datetime import datetime, timedelta
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, precision_score, recall_score, f1_score
+from xgboost import XGBClassifier
+from sklearn.preprocessing import LabelEncoder
+from imblearn.metrics import geometric_mean_score
+import matplotlib.pyplot as plt
+
+try:
+    import folium
+    from streamlit_folium import st_folium
+    HAS_FOLIUM = True
+except ImportError:
+    HAS_FOLIUM = False
+
+st.set_page_config(
+    page_title="Prediksi Banjir Dayeuhkolot",
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
+
+# --- FUNGSI LOGIKA DARI XGBoost.ipynb ---
+def tentukan_level_banjir(tma):
+    """
+    Menentukan level banjir berdasarkan Tinggi Muka Air (TMA) sesuai notebook.
+    Threshold:
+    - Normal  : < 0.57 m
+    - Waspada : 0.57 - 0.93 m
+    - Siaga   : 0.93 - 1.30 m
+    - Awas    : > 1.30 m
+    """
+    if tma < 0.57:
+        return '0 - Normal'
+    elif 0.57 <= tma < 0.93:
+        return '1 - Waspada (Siaga 3)'
+    elif 0.93 <= tma <= 1.30:
+        return '2 - Siaga (Siaga 2)'
+    else:
+        return '3 - Awas (Siaga 1)'
+
+
+def _normalisasi_nama(s):
+    """Normalisasi nama stasiun (huruf kecil, hapus spasi & tanda hubung) supaya variasi
+    penulisan seperti 'Cisondari - Pasirjambu' vs 'Cisondari-Pasir Jambu' tetap dikenali sebagai
+    stasiun yang sama."""
+    return str(s).lower().replace(' ', '').replace('-', '')
+
+
+def cocokkan_kecamatan(daftar_kelas, nama_target):
+    """Mencocokkan nama 'aliran induk' (dari pemetaan_aliran) ke salah satu nama Kecamatan
+    yang benar-benar ada di dataset CSV. Dilakukan bertahap: cocok persis (setelah normalisasi),
+    lalu cocok sebagian (substring), lalu fallback ke 'Dayeuhkolot' (data paling lengkap).
+    Mengembalikan nama_kecamatan_terpilih."""
+    daftar_kelas = list(daftar_kelas)
+    target_norm = _normalisasi_nama(nama_target)
+
+    for c in daftar_kelas:
+        if _normalisasi_nama(c) == target_norm:
+            return c
+    for c in daftar_kelas:
+        c_norm = _normalisasi_nama(c)
+        if target_norm in c_norm or c_norm in target_norm:
+            return c
+    if "Dayeuhkolot" in daftar_kelas:
+        return "Dayeuhkolot"
+    return daftar_kelas[0] if daftar_kelas else None
+
+
+def get_level_style(label):
+    """Mapping ikon, warna, dan deskripsi singkat untuk tiap level banjir,
+    dipakai untuk tampilan ala widget cuaca pada tab Prakiraan 7 Hari."""
+    if "Awas" in label:
+        return {"icon": "⛈️", "color": "#ff5c5c", "bg": "#3a1414", "short": "Awas", "desc": "Evakuasi segera"}
+    elif "Siaga" in label:
+        return {"icon": "🌧️", "color": "#ff9f43", "bg": "#3a2814", "short": "Siaga", "desc": "Waspada tinggi"}
+    elif "Waspada" in label:
+        return {"icon": "⛅", "color": "#f5d547", "bg": "#3a3414", "short": "Waspada", "desc": "Pantau terus"}
+    else:
+        return {"icon": "☀️", "color": "#4dd07a", "bg": "#143a1f", "short": "Normal", "desc": "Kondisi aman"}
+
+
+pemetaan_aliran = {
+    # 1. Aliran Citarum (Utama)
+    "Dayeuhkolot": "Dayeuhkolot",
+    "Situ Cisanti (Hulu Citarum, Kertasari)": "Dayeuhkolot",
+    "Cisanti": "Dayeuhkolot", 
+    "Kertasari": "Dayeuhkolot",
+    "Wangisagara (Majalaya)": "Dayeuhkolot",
+    "Majalaya": "Dayeuhkolot",
+    "Sapan (Titik temu beberapa anak sungai)": "Dayeuhkolot",
+    "Rancamanyar (Baleendah)": "Dayeuhkolot",
+    "Nanjung (Margaasih)": "Dayeuhkolot",
+    "Cabangbungin (Hilir Citarum)": "Dayeuhkolot",
+    "Hantap": "Dayeuhkolot",
+
+    # 2. Aliran Cisangkuy
+    "Cipanas - Margamukti (Pangalengan)": "Cipanas - Margamukti",
+    "Cipanas": "Cipanas - Margamukti",
+    "Cileunca - Wanasari (Pangalengan)": "Cipanas - Margamukti",
+    "Cileunca": "Cipanas - Margamukti",
+    "Kertamanah - Margamukti (Pangalengan)": "Cipanas - Margamukti",
+    "Kertamanah": "Cipanas - Margamukti",
+    "Kamasan (Banjaran)": "Cipanas - Margamukti",
+    "Pataruman (Baleendah)": "Cipanas - Margamukti",
+    "Arjasari": "Cipanas - Margamukti",
+
+    # 3. Aliran Citarik & Cikeruh
+    "Cikeruh - Jatiroke": "Cikeruh - Jatiroke",
+    "Jatiroke": "Cikeruh - Jatiroke",
+    "Cicalengka (Termasuk titik Dampit)": "Cikeruh - Jatiroke",
+    "Ciluluk - Cikancung": "Cikeruh - Jatiroke",
+    "Ciluluk": "Cikeruh - Jatiroke",
+    "Rancaekek": "Cikeruh - Jatiroke",
+    "Solokan Jeruk (Titik Citarik)": "Cikeruh - Jatiroke",
+    "Mangalayang": "Cikeruh - Jatiroke",
+
+    # 4. Aliran Ciwidey & Cisondari
+    "Cisondari - Pasirjambu": "Cisondari - Pasirjambu",
+    "Cisondari": "Cisondari - Pasirjambu",
+    "Ciwidey": "Cisondari - Pasirjambu",
+    "Cibeureum Sadu (Soreang)": "Cisondari - Pasirjambu",
+    "Rancaupas": "Cisondari - Pasirjambu",
+
+    # 5. Aliran Lainnya / Lokal
+    "Bojongsoang": "Bojongsoang",
+    "Cigede - Komplek Radio (Bojongsoang)": "Bojongsoang",
+    "Cijalupang - Peundeuy": "Bojongsoang",
+    "Cipaku - Paseh": "Bojongsoang",
+    "Cipaku Paseh": "Bojongsoang" 
+}
+
+koordinat_stasiun = {
+    "Dayeuhkolot": [-6.9881, 107.6281],
+    "Cipanas - Margamukti": [-7.2185, 107.5565],
+    "Cikeruh - Jatiroke": [-6.9450, 107.7680],
+    "Cisondari - Pasirjambu": [-7.0680, 107.4780],
+    "Bojongsoang": [-6.9740, 107.6400]
+}
+
+
+# --- FUNGSI PEMBERSIH OUTLIER (BARU) ---
+def bersihkan_outlier(df, kolom_list, faktor_iqr=1.5):
+    """
+    Membuang / meng-clip nilai ekstrem (outlier) pada kolom numerik menggunakan metode IQR.
+    Ini penting karena sensor lapangan (Curah Hujan, Debit Air, Muka Air) kadang mencatat
+    nilai yang salah input / error alat (misalnya TMA tercatat puluhan meter), dan nilai
+    seperti itu bisa membuat rata-rata (mean) klimatologi jadi jauh meleset dari kondisi
+    nyata -- inilah sebab prakiraan 7 hari sebelumnya selalu menunjukkan TMA ~4 m / status
+    Awas terus-menerus walau di lapangan kondisinya jauh lebih rendah.
+
+    Nilai di luar [Q1 - faktor*IQR, Q3 + faktor*IQR] di-clip ke batas tersebut (bukan dibuang
+    barisnya), supaya jumlah data historis tidak berkurang tapi pengaruh outlier ekstremnya
+    dijinakkan.
+    """
+    df = df.copy()
+    info_outlier = {}
+    for col in kolom_list:
+        if col not in df.columns:
+            continue
+        data_valid = df[col].dropna()
+        if data_valid.empty:
+            continue
+        q1 = data_valid.quantile(0.25)
+        q3 = data_valid.quantile(0.75)
+        iqr = q3 - q1
+        if iqr == 0 or pd.isna(iqr):
+            continue
+        batas_bawah = q1 - faktor_iqr * iqr
+        batas_atas = q3 + faktor_iqr * iqr
+        # Muka Air / Debit Air / Curah Hujan secara fisik tidak boleh negatif
+        batas_bawah = max(batas_bawah, 0)
+
+        n_outlier = int(((df[col] < batas_bawah) | (df[col] > batas_atas)).sum())
+        info_outlier[col] = {"n_outlier": n_outlier, "batas_bawah": batas_bawah, "batas_atas": batas_atas}
+
+        df[col] = df[col].clip(lower=batas_bawah, upper=batas_atas)
+
+    return df, info_outlier
+
+
+# --- SIDEBAR ---
+with st.sidebar:
+    try:
+        st.image("Dayeuhkolot.jpg", use_container_width=True)
+    except:
+        pass
+        
+    st.header("🎛️ Parameter Input")
+    st.write("Masukkan data untuk dianalisis:")
+    
+    lokasi_select = st.selectbox("Pilih Lokasi (Kecamatan/Daerah)", options=list(pemetaan_aliran.keys()))
+    curah_hujan = st.number_input("Curah Hujan (mm)", min_value=0.0, step=0.1)
+    debit_air = st.number_input("Debit Air (m³/s)", min_value=0.0, step=0.1)
+    muka_air = st.number_input("Tinggi Muka Air (m)", min_value=0.0, step=0.1)
+    # Tinggi banjir tetap ada sebagai input tetapi tidak digunakan fitur model XGB (sesuai ipynb)
+    tinggi_banjir_input = st.number_input("Tinggi Genangan Air (m)", min_value=0.0, max_value=5.0, step=0.01)
+    
+    tombol_prediksi = st.button("🔍 Jalankan Prediksi", use_container_width=True, type="primary")
+
+# --- FUNGSI LOAD DATA & TRAINING (ADAPTASI XGBOOST.IPYNB) ---
+@st.cache_resource
+def prepare_model(lokasi_terpilih):
+    # Menggunakan file utama dari notebook
+    filename = "Banjir all - Data Acak (1).csv"
+    try:
+        df_train = pd.read_csv(filename)
+    except:
+        return None, None, None, None
+
+    # Cleaning sesuai notebook
+    df_train = df_train.drop(columns=['Tanggal', 'Tinggi Banjir', 'Banjir Ya/Tidak'], errors='ignore')
+    df_train = df_train.replace('-', np.nan)
+    
+    kolom_numerik = ['Curah Hujan', 'Debit Air', 'Muka Air']
+    for col in kolom_numerik:
+        df_train[col] = pd.to_numeric(df_train[col], errors='coerce')
+    
+    df_train = df_train.ffill().bfill()
+
+    # (BARU) Bersihkan outlier / nilai error sensor SEBELUM dipakai untuk melatih model,
+    # supaya model tidak ikut belajar dari nilai yang tidak masuk akal.
+    df_train, info_outlier_train = bersihkan_outlier(df_train, kolom_numerik)
+
+    # Target Engineering (Level Banjir) -- dihitung SETELAH outlier dibersihkan
+    df_train['Level_Banjir'] = df_train['Muka Air'].apply(tentukan_level_banjir)
+
+    # Encoding Fitur (Kecamatan)
+    le_kec = LabelEncoder()
+    df_train['Kecamatan'] = le_kec.fit_transform(df_train['Kecamatan'])
+    
+    # Encoding Target
+    le_target = LabelEncoder()
+    df_train['Level_Banjir'] = le_target.fit_transform(df_train['Level_Banjir'])
+
+    X = df_train.drop(columns=['Level_Banjir'])
+    y = df_train['Level_Banjir']
+
+    # Split untuk metrik
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Model XGBoost sesuai notebook
+    model_xgb = XGBClassifier(
+        n_estimators=100,
+        learning_rate=0.1,
+        max_depth=5,
+        random_state=42,
+        eval_metric='mlogloss'
+    )
+    model_xgb.fit(X_train, y_train)
+    
+    # Hitung metrik untuk tab Performa
+    y_pred = model_xgb.predict(X_test)
+    metrics = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "report": classification_report(y_test, y_pred, target_names=le_target.classes_, output_dict=True),
+        "gmean": geometric_mean_score(y_test, y_pred, average='macro'),
+        "cm": confusion_matrix(y_test, y_pred),
+        "outlier_info": info_outlier_train,
+    }
+
+    return model_xgb, le_kec, le_target, metrics
+
+
+DAFTAR_FILE_DATASET = [
+    "Banjir all - Data Acak (1).csv",
+    "Banjir_all_-_Data_Acak__1___1_.csv",
+]
+
+
+@st.cache_data
+def load_dataset_mentah():
+    """Memuat ulang CSV historis secara 'mentah' (kolom Tanggal & Kecamatan tetap utuh,
+    tidak di-encode) khusus untuk dipakai sebagai acuan statistik/klimatologi pada tab
+    Prakiraan 7 Hari. Mengembalikan None bila file tidak ditemukan, supaya tab tetap bisa
+    jalan dalam mode simulasi murni (fallback)."""
+    df_mentah = None
+    for fname in DAFTAR_FILE_DATASET:
+        try:
+            df_mentah = pd.read_csv(fname)
+            break
+        except Exception:
+            continue
+    if df_mentah is None:
+        return None
+
+    df_mentah = df_mentah.replace('-', np.nan)
+    for col in ['Curah Hujan', 'Debit Air', 'Muka Air']:
+        if col in df_mentah.columns:
+            df_mentah[col] = pd.to_numeric(df_mentah[col], errors='coerce')
+
+    # (BARU) Bersihkan outlier di data mentah juga, karena inilah sumber angka klimatologi
+    # (rata-rata historis) yang dipakai tab "Prakiraan 7 Hari". Tanpa ini, satu-dua baris
+    # dengan nilai sensor yang error bisa membuat rata-rata melenceng jauh (contoh nyata:
+    # TMA prakiraan nyangkut di ~4 m terus padahal kondisi normalnya jauh di bawah itu).
+    df_mentah, _ = bersihkan_outlier(df_mentah, ['Curah Hujan', 'Debit Air', 'Muka Air'])
+
+    df_mentah['Tanggal'] = pd.to_datetime(df_mentah['Tanggal'], errors='coerce')
+    df_mentah['DayOfYear'] = df_mentah['Tanggal'].dt.dayofyear
+    df_mentah['Kecamatan'] = df_mentah['Kecamatan'].astype(str).str.strip()
+    return df_mentah
+
+
+def get_climatology(df_hist, stasiun, target_doy, window=7):
+    """
+    Mengambil MEDIAN & IQR (bukan mean/std biasa) historis Curah Hujan, Debit Air, dan TMA
+    di sekitar tanggal target (+- `window` hari, lintas tahun 2020-2024) untuk stasiun
+    tertentu — ini yang membuat prakiraan H+1..H+6 'berbasis dataset' alih-alih angka acak
+    sembarangan.
+
+    (PERBAIKAN) Sebelumnya fungsi ini memakai MEAN, yang sangat sensitif terhadap outlier:
+    walau outlier sudah di-clip di tahap load, memakai median di sini menambah lapisan
+    ketahanan ekstra supaya klimatologi tetap representatif terhadap kondisi tipikal,
+    bukan tertarik oleh beberapa hari ekstrem di histori.
+
+    Fallback bertingkat dipakai bila data spesifik tidak cukup:
+    1) stasiun terkait pada musim yang sama, 2) seluruh histori stasiun terkait,
+    3) seluruh histori Dayeuhkolot (data terlengkap), 4) rata-rata seluruh dataset.
+    """
+    kolom = ['Curah Hujan', 'Debit Air', 'Muka Air']
+
+    def ringkas(sub):
+        if sub is None or sub.empty:
+            return None
+        if sub[kolom].dropna(how='all').empty:
+            return None
+        return {
+            'hujan_mean': sub['Curah Hujan'].median(skipna=True),
+            'hujan_std': sub['Curah Hujan'].std(skipna=True),
+            'debit_mean': sub['Debit Air'].median(skipna=True),
+            'debit_std': sub['Debit Air'].std(skipna=True),
+            'muka_mean': sub['Muka Air'].median(skipna=True),
+            'muka_std': sub['Muka Air'].std(skipna=True),
+            'n': len(sub),
+        }
+
+    sub_stasiun = df_hist[df_hist['Kecamatan'] == stasiun]
+
+    diff = (sub_stasiun['DayOfYear'] - target_doy).abs()
+    diff = np.minimum(diff, 365 - diff)
+    musiman = ringkas(sub_stasiun[diff <= window]) if not sub_stasiun.empty else None
+    if musiman and pd.notna(musiman['muka_mean']) and musiman['n'] >= 3:
+        hasil = musiman
+    else:
+        hasil = ringkas(sub_stasiun)
+
+    fallback_dayeuhkolot = ringkas(df_hist[df_hist['Kecamatan'] == 'Dayeuhkolot'])
+    fallback_global = ringkas(df_hist)
+
+    if hasil is None:
+        hasil = fallback_dayeuhkolot or fallback_global or {}
+
+    # Tambal field per-field yang masih NaN (mis. stasiun tidak punya data Debit/TMA)
+    for sumber in (fallback_dayeuhkolot, fallback_global):
+        if sumber is None:
+            continue
+        for k in ['hujan_mean', 'hujan_std', 'debit_mean', 'debit_std', 'muka_mean', 'muka_std']:
+            if k not in hasil or pd.isna(hasil.get(k)):
+                hasil[k] = sumber.get(k)
+
+    # Penjaga terakhir bila tetap NaN semua
+    default_aman = {
+        'hujan_mean': 10.0, 'hujan_std': 12.0,
+        'debit_mean': 40.0, 'debit_std': 20.0,
+        'muka_mean': 0.6, 'muka_std': 0.3,
+    }
+    for k, v in default_aman.items():
+        if k not in hasil or pd.isna(hasil.get(k)):
+            hasil[k] = v
+
+    return hasil
+
+
+def generate_weekly_forecast(model, le_kec, le_target, df_hist, aliran_induk, start_date=None):
+    """
+    Membuat prakiraan 7 hari ke depan (Hari Ini s.d. H+6) LANGSUNG dari tanggal di dataset,
+    tanpa perlu input manual apa pun.
+
+    Untuk tiap tanggal target (Hari Ini, Hari Ini+1, ..., Hari Ini+6), nilai Curah Hujan,
+    Debit Air, dan TMA diambil dari MEDIAN historis pada TANGGAL YANG SAMA (bulan & hari)
+    di seluruh tahun yang tersedia pada dataset (2020-2024) untuk stasiun terkait, setelah
+    data dibersihkan dari outlier. Contoh: untuk meramal 8 Januari, dipakai median data
+    tanggal 8 Januari dari tahun 2020, 2021, 2022, 2023, dan 2024 (memakai jendela +-7 hari
+    di sekitarnya bila datanya terlalu sedikit pada tanggal persis tersebut).
+
+    Bila dataset historis tidak ditemukan (df_hist None), mengembalikan (None, None, False)
+    supaya pemanggil bisa menampilkan pesan bahwa dataset diperlukan untuk tab ini.
+    """
+    if df_hist is None:
+        return None, None, False
+
+    daftar_kelas = list(le_kec.classes_)
+    stasiun_cocok = cocokkan_kecamatan(daftar_kelas, aliran_induk)
+    try:
+        kec_encoded = le_kec.transform([stasiun_cocok])[0]
+    except Exception:
+        kec_encoded = 0
+
+    titik_awal = start_date or datetime.now()
+    hasil = []
+
+    for i in range(7):
+        tanggal_target = titik_awal + timedelta(days=i)
+        target_doy = tanggal_target.timetuple().tm_yday
+
+        clim = get_climatology(df_hist, stasiun_cocok, target_doy)
+
+        hujan = float(np.clip(clim['hujan_mean'], 0, 250))
+        debit = float(np.clip(clim['debit_mean'], 0, 700))
+        # (PERBAIKAN) Batas atas TMA realistis diperketat dari 10 m menjadi 5 m.
+        # TMA 5-10 meter tidak masuk akal untuk sungai di wilayah ini dan sebelumnya bisa
+        # lolos begitu saja ke model jika klimatologi kebetulan menghasilkan angka besar.
+        muka = float(np.clip(clim['muka_mean'], 0, 5))
+
+        input_df = pd.DataFrame(
+            [[kec_encoded, hujan, debit, muka]],
+            columns=['Kecamatan', 'Curah Hujan', 'Debit Air', 'Muka Air']
+        )
+        idx_pred = model.predict(input_df)[0]
+        label_pred = le_target.inverse_transform([idx_pred])[0]
+        conf = float(max(model.predict_proba(input_df)[0]))
+
+        hasil.append({
+            "tanggal": tanggal_target,
+            "hujan": hujan,
+            "debit": debit,
+            "muka": muka,
+            "hujan_std": clim.get('hujan_std', 0.0) or 0.0,
+            "muka_std": clim.get('muka_std', 0.0) or 0.0,
+            "n_tahun": clim.get('n', 0),
+            "label": label_pred,
+            "confidence": conf
+        })
+
+    return hasil, stasiun_cocok, True
+
+
+# Inisialisasi model
+model, le_kec, le_target, model_metrics = prepare_model(lokasi_select)
+df_hist = load_dataset_mentah()
+
+# --- MAIN UI ---
+st.title(" Sistem Peringatan Dini Banjir Berbasis Aliran Sungai")
+st.markdown("Pantau dan prediksi potensi banjir di wilayah Kabupaten Bandung menggunakan algoritma **XGBoost Classifier**.")
+
+if model is None:
+    st.error("File 'Banjir all - Data Acak (1).csv' tidak ditemukan!")
+    st.stop()
+
+st.markdown("---")
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Prediksi Level Siaga & Peta",
+    " Simulasi Real-time",
+    "Performa Model AI",
+    "📅 Prakiraan 7 Hari"
+])
+
+with tab1:
+    col_hasil, col_peta = st.columns([1, 1.2]) 
+    
+    with col_hasil:
+        st.subheader("Hasil Analisis Level Banjir")
+        if tombol_prediksi:
+            # Preprocessing input
+            aliran_induk = pemetaan_aliran.get(lokasi_select, "Dayeuhkolot")
+            # Encode lokasi (cocokkan nama aliran induk ke nama Kecamatan asli di dataset)
+            stasiun_cocok_t1 = cocokkan_kecamatan(list(le_kec.classes_), aliran_induk)
+            try:
+                kec_encoded = le_kec.transform([stasiun_cocok_t1])[0]
+            except:
+                kec_encoded = 0 # Default ke index pertama jika unknown
+            
+            input_df = pd.DataFrame([[kec_encoded, curah_hujan, debit_air, muka_air]], 
+                                   columns=['Kecamatan', 'Curah Hujan', 'Debit Air', 'Muka Air'])
+            
+            # Prediksi
+            res_idx = model.predict(input_df)[0]
+            res_label = le_target.inverse_transform([res_idx])[0]
+            probs = model.predict_proba(input_df)[0]
+            confidence = max(probs)
+
+            st.info(f"ℹ️ Analisis berdasarkan stasiun utama: **{aliran_induk}**")
+            if stasiun_cocok_t1 != aliran_induk:
+                st.caption(f"Dicocokkan ke data historis stasiun: *{stasiun_cocok_t1}* (nama 'aliran induk' tidak persis sama dengan nama Kecamatan di dataset).")
+            
+            if "Awas" in res_label:
+                st.error(f"🚨 **STATUS: {res_label}**")
+                st.write("Segera lakukan evakuasi dan amankan barang berharga!")
+            elif "Siaga" in res_label:
+                st.warning(f"⚠️ **STATUS: {res_label}**")
+                st.write("Waspada, air mulai memasuki pemukiman.")
+            elif "Waspada" in res_label:
+                st.warning(f"🟡 **STATUS: {res_label}**")
+                st.write("Siaga terhadap kenaikan debit air kiriman.")
+            else:
+                st.success(f"✅ **STATUS: {res_label}**")
+                st.write("Kondisi saat ini terpantau aman.")
+                
+            st.progress(float(confidence), text=f"Tingkat Keyakinan Model: {confidence:.2%}")
+            
+            st.write("---")
+            st.write("**Data Input:**")
+            st.write(f"- TMA: {muka_air} m | Curah Hujan: {curah_hujan} mm")
+        else:
+            st.info("👈 Silakan atur parameter di panel samping dan tekan tombol 'Jalankan Prediksi'.")
+
+    with col_peta:
+        st.subheader("Peta Pantauan Sungai (GIS)")
+        stasiun_utama = pemetaan_aliran.get(lokasi_select, "Dayeuhkolot")
+        
+        if HAS_FOLIUM:
+            koor = koordinat_stasiun.get(stasiun_utama, [-6.9881, 107.6281]) 
+            m = folium.Map(location=koor, zoom_start=13, tiles="CartoDB positron")
+            
+            folium.Marker(
+                koor, 
+                popup=f"Stasiun Acuan: {stasiun_utama}", 
+                icon=folium.Icon(color="red", icon="info-sign")
+            ).add_to(m)
+            
+            folium.Circle(
+                location=koor,
+                radius=1500,
+                color='crimson',
+                fill=True,
+                fill_color='crimson'
+            ).add_to(m)
+
+            st_folium(m, width=500, height=350, returned_objects=[])
+        else:
+            st.warning("Library 'folium' belum terinstal.")
+
+with tab2:
+    st.subheader("Pantauan Sensor Virtual (Simulasi Real-time)")
+    
+    if st.button("Cek Kondisi Terkini (Simulasi)"):
+        # Random data simulasi
+        sim_hujan = random.uniform(0, 120)
+        sim_debit = random.uniform(20, 200)
+        sim_muka = random.uniform(0.1, 1.8)
+        
+        # Prediksi simulasi
+        sim_input = pd.DataFrame([[0, sim_hujan, sim_debit, sim_muka]], 
+                                columns=['Kecamatan', 'Curah Hujan', 'Debit Air', 'Muka Air'])
+        sim_idx = model.predict(sim_input)[0]
+        sim_label = le_target.inverse_transform([sim_idx])[0]
+        
+        wib_now = datetime.utcnow() + timedelta(hours=7)
+        
+        # UI Box Status
+        bg_color = "#ffebeb" if "Awas" in sim_label or "Siaga" in sim_label else "#e8fdf0"
+        border_color = "red" if "Awas" in sim_label or "Siaga" in sim_label else "green"
+        
+        st.markdown(f"""
+        <div style="padding: 15px; border-radius: 10px; background-color: {bg_color}; border: 1px solid {border_color};">
+            <h3>📢 Status: {sim_label}</h3>
+            <p>Diperbarui pada: <b>{wib_now.strftime("%H:%M:%S WIB")}</b></p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.write("")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Curah Hujan", f"{sim_hujan:.1f} mm")
+        k2.metric("Debit Air", f"{sim_debit:.1f} m³/s")
+        k3.metric("Muka Air (TMA)", f"{sim_muka:.2f} m")
+
+with tab3:
+    st.subheader("Detail Evaluasi Algoritma XGBoost")
+    
+    m1, m2 = st.columns(2)
+    m1.metric("Akurasi Model", f"{model_metrics['accuracy']:.2%}")
+    m2.metric("G-Mean Score", f"{model_metrics['gmean']:.4f}")
+    
+    st.divider()
+    col_cm, col_rep = st.columns([1, 1.5])
+    
+    with col_cm:
+        st.write("**Confusion Matrix:**")
+        cm_df = pd.DataFrame(
+            model_metrics['cm'], 
+            index=[f"Aktual {c}" for c in le_target.classes_],
+            columns=[f"Prediksi {c}" for c in le_target.classes_]
+        )
+        st.table(cm_df)
+        
+    with col_rep:
+        st.write("**Detail Laporan Klasifikasi per Level:**")
+        report_df = pd.DataFrame(model_metrics['report']).transpose()
+        st.dataframe(report_df.style.format(precision=2))
+
+    st.info("""
+    **Catatan Teknis:**
+    - Model menggunakan **XGBoost Classifier** dengan parameter `mlogloss`.
+    - Klasifikasi dibagi menjadi 4 kelas sesuai standar TMA di notebook.
+    - Data dilatih menggunakan dataset: `Banjir all - Data Acak (1).csv`.
+    """)
+
+    # (BARU) Tampilkan info outlier yang dibersihkan, biar transparan ke pengguna
+    outlier_info = model_metrics.get("outlier_info", {})
+    if outlier_info:
+        with st.expander("🔍 Info Pembersihan Outlier pada Data Latih"):
+            for col, info in outlier_info.items():
+                st.write(
+                    f"- **{col}**: {info['n_outlier']} baris di-clip ke rentang "
+                    f"[{info['batas_bawah']:.2f}, {info['batas_atas']:.2f}] "
+                    f"(nilai di luar rentang ini dianggap outlier/error sensor)."
+                )
+
+with tab4:
+    st.subheader("📅 Prakiraan Potensi Banjir 7 Hari ke Depan")
+    aliran_induk_fc = pemetaan_aliran.get(lokasi_select, "Dayeuhkolot")
+    st.write(
+        f"Prakiraan untuk stasiun acuan **{aliran_induk_fc}** dihitung otomatis dari **tanggal** "
+        f"pada dataset historis — tanpa perlu mengisi apa pun. Untuk tiap hari ke depan, nilai "
+        f"Curah Hujan, Debit Air, dan TMA diambil dari **median** kondisi pada **tanggal yang sama** "
+        f"di tahun-tahun sebelumnya (2020-2024, setelah outlier dibersihkan), lalu dinilai ulang oleh "
+        f"model XGBoost. Contoh: untuk meramal 8 Januari, dipakai median data tanggal 8 Januari dari "
+        f"tahun 2020 sampai 2024."
+    )
+
+    perlu_generate = (
+        "weekly_forecast" not in st.session_state
+        or st.session_state.get("weekly_forecast_lokasi") != lokasi_select
+    )
+
+    if perlu_generate:
+        forecast_baru, stasiun_acuan_fc, pakai_klimatologi = generate_weekly_forecast(
+            model, le_kec, le_target, df_hist, aliran_induk_fc
+        )
+        st.session_state["weekly_forecast"] = forecast_baru
+        st.session_state["weekly_forecast_stasiun"] = stasiun_acuan_fc
+        st.session_state["weekly_forecast_klimatologi"] = pakai_klimatologi
+        st.session_state["weekly_forecast_lokasi"] = lokasi_select
+        st.session_state["weekly_forecast_time"] = datetime.utcnow() + timedelta(hours=7)
+
+    forecast = st.session_state["weekly_forecast"]
+    waktu_buat = st.session_state.get("weekly_forecast_time")
+    stasiun_acuan_fc = st.session_state.get("weekly_forecast_stasiun", aliran_induk_fc)
+    pakai_klimatologi = st.session_state.get("weekly_forecast_klimatologi", False)
+
+    if not pakai_klimatologi or forecast is None:
+        st.error(
+            "Dataset historis (`Banjir all - Data Acak (1).csv`) tidak ditemukan di server, "
+            "sehingga prakiraan berbasis tanggal tidak bisa dihitung. Pastikan file dataset "
+            "berada di folder yang sama dengan `app.py`."
+        )
+        st.stop()
+
+    if stasiun_acuan_fc != aliran_induk_fc:
+        st.caption(
+            f"Catatan: stasiun **{aliran_induk_fc}** tidak punya histori cukup pada dataset, "
+            f"sehingga pola musiman diambil dari data stasiun **{stasiun_acuan_fc}** sebagai acuan terdekat."
+        )
+
+    # --- Label hari & tanggal dalam Bahasa Indonesia ---
+    hari_full_id = {0: 'Senin', 1: 'Selasa', 2: 'Rabu', 3: 'Kamis', 4: 'Jumat', 5: 'Sabtu', 6: 'Minggu'}
+    hari_singkat_id = {0: 'Sen', 1: 'Sel', 2: 'Rab', 3: 'Kam', 4: 'Jum', 5: 'Sab', 6: 'Min'}
+    bulan_id = {1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'Mei', 6: 'Jun',
+                7: 'Jul', 8: 'Agu', 9: 'Sep', 10: 'Okt', 11: 'Nov', 12: 'Des'}
+
+    labels_hari = []
+    for i, hari in enumerate(forecast):
+        d = hari["tanggal"]
+        if i == 0:
+            labels_hari.append("Hari Ini")
+        elif i == 1:
+            labels_hari.append("Besok")
+        else:
+            labels_hari.append(f"{hari_singkat_id[d.weekday()]}, {d.day} {bulan_id[d.month]}")
+
+    today = forecast[0]["tanggal"]
+    tanggal_hari_ini = f"{hari_full_id[today.weekday()]}, {today.day} {bulan_id[today.month]} {today.year}"
+
+    # --- Ringkasan "Hari Ini" ala widget cuaca ---
+    style_today = get_level_style(forecast[0]["label"])
+    st.markdown(f"""
+    <div style="background:#14161c; border-radius:16px; padding:24px 28px;
+                display:flex; justify-content:space-between; align-items:center;
+                flex-wrap:wrap; gap:12px; margin-bottom:18px;">
+        <div style="display:flex; align-items:center; gap:18px;">
+            <div style="font-size:56px; line-height:1;">{style_today['icon']}</div>
+            <div>
+                <div style="color:#fff; font-size:36px; font-weight:700; line-height:1.1;">{forecast[0]['muka']:.2f} m</div>
+                <div style="color:#9aa0a6; font-size:13px; margin-top:6px;">
+                    Curah Hujan: {forecast[0]['hujan']:.0f} mm &nbsp;|&nbsp;
+                    Debit Air: {forecast[0]['debit']:.0f} m³/s &nbsp;|&nbsp;
+                    Rata-rata dari {forecast[0]['n_tahun']} titik data historis
+                </div>
+            </div>
+        </div>
+        <div style="text-align:right;">
+            <div style="color:#fff; font-size:20px; font-weight:600;">Prakiraan Banjir</div>
+            <div style="color:#9aa0a6; font-size:13px;">{tanggal_hari_ini}</div>
+            <div style="color:{style_today['color']}; font-size:16px; font-weight:700;">{style_today['short']}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # --- Grafik tren TMA 7 hari (gaya area chart seperti widget cuaca) ---
+    tma_values = [h["muka"] for h in forecast]
+    fig, ax = plt.subplots(figsize=(10, 2.6))
+    fig.patch.set_facecolor('#14161c')
+    ax.set_facecolor('#14161c')
+    x = list(range(7))
+    ax.plot(x, tma_values, color='#f5c518', linewidth=2.5, zorder=3)
+    ax.fill_between(x, tma_values, color='#6b6b1a', alpha=0.55, zorder=2)
+    rentang = max(tma_values) - min(tma_values)
+    y_pad = rentang * 0.15 + 0.05 if rentang > 0 else 0.2
+    for i, v in enumerate(tma_values):
+        ax.text(i, v + y_pad * 0.35, f"{v:.2f}", color='white', fontsize=9, ha='center')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels_hari, color='#9aa0a6', fontsize=9)
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(axis='x', colors='#9aa0a6', length=0)
+    ax.margins(y=0.3)
+    st.pyplot(fig, use_container_width=True)
+
+    st.write("")
+
+    # --- Kartu per hari (mirip kartu Fri/Sat/Sun... pada referensi) ---
+    cols = st.columns(7)
+    for i, (col, hari) in enumerate(zip(cols, forecast)):
+        style = get_level_style(hari["label"])
+        border_w = "2px" if i == 0 else "1px"
+        with col:
+            st.markdown(f"""
+            <div style="background:{style['bg']}; border-radius:14px; padding:14px 6px;
+                        text-align:center; border:{border_w} solid {style['color']}66;">
+                <div style="color:#cfd2d6; font-size:12px; margin-bottom:6px;">{labels_hari[i]}</div>
+                <div style="font-size:30px;">{style['icon']}</div>
+                <div style="color:{style['color']}; font-weight:700; font-size:12px; margin-top:6px;">{style['short']}</div>
+                <div style="color:#fff; font-size:13px; margin-top:4px;">{hari['muka']:.2f} m</div>
+                <div style="color:#9aa0a6; font-size:11px; margin-top:2px;">{hari['hujan']:.0f} mm</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    if waktu_buat:
+        st.caption(
+            f"Dihitung pada {waktu_buat.strftime('%H:%M:%S WIB')} dari median historis "
+            f"tanggal yang sama di dataset (stasiun acuan: {stasiun_acuan_fc}, outlier sudah dibersihkan). "
+            "Prakiraan akan menyesuaikan otomatis tiap hari, dan ikut berubah bila lokasi diganti."
+        )
+
+    st.divider()
+    st.write("**Keterangan Level:**")
+    leg_cols = st.columns(4)
+    legend_items = [
+        ("☀️", "#4dd07a", "0 - Normal", "TMA < 0.57 m"),
+        ("⛅", "#f5d547", "1 - Waspada", "0.57 - 0.93 m"),
+        ("🌧️", "#ff9f43", "2 - Siaga", "0.93 - 1.30 m"),
+        ("⛈️", "#ff5c5c", "3 - Awas", "> 1.30 m"),
+    ]
+    for col, (icon, color, label, rng_txt) in zip(leg_cols, legend_items):
+        with col:
+            st.markdown(f"""
+            <div style="text-align:center;">
+                <div style="font-size:22px;">{icon}</div>
+                <div style="color:{color}; font-weight:600; font-size:13px;">{label}</div>
+                <div style="color:#9aa0a6; font-size:11px;">{rng_txt}</div>
+            </div>
+            """, unsafe_allow_html=True)
