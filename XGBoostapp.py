@@ -189,7 +189,7 @@ with st.sidebar:
     except:
         pass
         
-    st.header("🎛️ Parameter Input")
+    st.header("Parameter Input")
     st.write("Masukkan data untuk dianalisis:")
     
     lokasi_select = st.selectbox("Pilih Lokasi (Kecamatan/Daerah)", options=list(pemetaan_aliran.keys()))
@@ -307,18 +307,18 @@ def load_dataset_mentah():
 def get_climatology(df_hist, stasiun, target_doy, window=7):
     """
     Mengambil MEDIAN & IQR (bukan mean/std biasa) historis Curah Hujan, Debit Air, dan TMA
-    di sekitar tanggal target (+- `window` hari, lintas tahun 2020-2024) untuk stasiun
-    tertentu — ini yang membuat prakiraan H+1..H+6 'berbasis dataset' alih-alih angka acak
-    sembarangan.
+    HANYA dari rentang tanggal target +- `window` hari (default 7 hari sebelum & 7 hari
+    setelah tanggal target, lintas semua tahun di dataset) untuk stasiun tertentu — ini yang
+    membuat prakiraan H+1..H+6 'berbasis dataset' alih-alih angka acak sembarangan.
 
-    (PERBAIKAN) Sebelumnya fungsi ini memakai MEAN, yang sangat sensitif terhadap outlier:
-    walau outlier sudah di-clip di tahap load, memakai median di sini menambah lapisan
-    ketahanan ekstra supaya klimatologi tetap representatif terhadap kondisi tipikal,
-    bukan tertarik oleh beberapa hari ekstrem di histori.
-
-    Fallback bertingkat dipakai bila data spesifik tidak cukup:
-    1) stasiun terkait pada musim yang sama, 2) seluruh histori stasiun terkait,
-    3) seluruh histori Dayeuhkolot (data terlengkap), 4) rata-rata seluruh dataset.
+    (PERBAIKAN) Sebelumnya fungsi ini memakai MEAN (sensitif ke outlier) dan, yang lebih
+    penting, PUNYA BUG: kalau titik data di jendela +-7 hari itu kurang dari 3, kode diam-diam
+    membuang jendela tersebut dan memakai SELURUH histori stasiun (bisa dari bulan yang jauh
+    berbeda musimnya) -- akibatnya klimatologi jadi tidak benar-benar "seminggu sebelum &
+    seminggu setelah" seperti yang dimaksud. Sekarang:
+    - Selama jendela +-7 hari punya >=1 titik data, jendela itulah yang dipakai (median).
+    - Fallback ke histori penuh stasiun / Dayeuhkolot / global HANYA dipakai bila jendela
+      +-7 hari itu benar-benar kosong (0 data), sebagai jaring pengaman terakhir saja.
     """
     kolom = ['Curah Hujan', 'Debit Air', 'Muka Air']
 
@@ -341,10 +341,16 @@ def get_climatology(df_hist, stasiun, target_doy, window=7):
 
     diff = (sub_stasiun['DayOfYear'] - target_doy).abs()
     diff = np.minimum(diff, 365 - diff)
-    musiman = ringkas(sub_stasiun[diff <= window]) if not sub_stasiun.empty else None
-    if musiman and pd.notna(musiman['muka_mean']) and musiman['n'] >= 3:
+    # Jendela +-7 hari (seminggu sebelum & seminggu setelah tanggal target, lintas tahun)
+    sub_jendela = sub_stasiun[diff <= window] if not sub_stasiun.empty else sub_stasiun
+    musiman = ringkas(sub_jendela)
+
+    if musiman is not None:
+        # Ada data di jendela +-7 hari -> WAJIB dipakai, berapa pun jumlah titiknya.
         hasil = musiman
     else:
+        # Jendela +-7 hari benar-benar kosong untuk stasiun ini -> baru fallback ke
+        # seluruh histori stasiun tersebut (lintas musim), lalu Dayeuhkolot, lalu global.
         hasil = ringkas(sub_stasiun)
 
     fallback_dayeuhkolot = ringkas(df_hist[df_hist['Kecamatan'] == 'Dayeuhkolot'])
@@ -456,7 +462,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "Prediksi Level Siaga & Peta",
     " Simulasi Real-time",
     "Performa Model AI",
-    "📅 Prakiraan 7 Hari"
+    "Prakiraan 7 Hari"
 ])
 
 with tab1:
